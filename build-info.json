@@ -1,0 +1,11 @@
+{
+  "ownership": "recommended",
+  "suppress_bundle_relocation": true,
+  "postinstall_action": "none",
+  "preserve_xattr": false,
+  "name": "autologin-lock-guard-${version}.pkg",
+  "identifier": "com.github.jholt13.autologin-lock-guard",
+  "install_location": "/",
+  "version": "1.1",
+  "distribution_style": false
+}

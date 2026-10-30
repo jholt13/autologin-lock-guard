@@ -1,0 +1,227 @@
+#!/bin/zsh
+#
+# autologin-lock-guard
+#
+# Clears the macOS latch that leaves an autologin Mac (e.g. a Zoom Room) stuck
+# on the lock screen after an OS update.
+#
+# https://github.com/jholt13/autologin-lock-guard
+#
+# The behavior, observed end to end on a Zoom Room:
+#
+#   1. A DDM-enforced OS update installs and reboots.
+#   2. macOS auto-logs the room in, then locks the screen. loginwindow logs this
+#      as kLWLockFromDirectLock (8). We cannot suppress it.
+#   3. loginwindow persists that state as autoLoginUserScreenLocked=true in
+#      /Library/Preferences/com.apple.loginwindow.plist.
+#   4. EVERY later boot re-locks from that flag, logged as
+#      kLWLockFromCookieFile (7) -- a plain `reboot` reproduces it. Nothing ever
+#      clears the flag, so the room stays stuck long after the update that set
+#      it, which is why this reads as "autologin has been broken for years".
+#
+# Same machine, five consecutive boots on the 26.5 -> 26.7 minor update:
+#
+#   11:07:30  plain reboot   no lock
+#   16:09:55  plain reboot   no lock
+#   16:52:59  OS UPDATE      kLWLockFromDirectLock (8)   <- sets the flag
+#   17:08:36  plain reboot   kLWLockFromCookieFile (7)   <- latched
+#   17:12:25  flag deleted   no lock, Zoom Rooms visible
+#
+# WHEN the lock lands varies enormously by update type, which is why this polls
+# for the condition rather than sleeping a fixed interval (v1.0 did the latter
+# and missed it entirely on a major upgrade):
+#
+#   26.5 -> 26.7   (minor)  lock ~95s after boot
+#   26.7 -> 27.0.1 (major)  lock 10m34s after boot -- macOS runs Template
+#                           Migration and Setup Assistant first, behind an
+#                           installer shield window. The lock lands 3 seconds
+#                           before Setup Assistant exits.
+#
+# There is no supported way to unlock a locked screen from the CLI, and this
+# daemon starts too late in boot to stop the lock happening, so recovery is a
+# single automatic reboot once the flag has been cleared.
+#
+# See README.md for the full write-up.
+
+emulate -L zsh
+setopt no_unset
+
+readonly LOGINWINDOW_PLIST='/Library/Preferences/com.apple.loginwindow'
+readonly LATCH_KEY='autoLoginUserScreenLocked'
+readonly STATE_FILE='/var/db/com.github.jholt13.autologin-lock-guard.build'
+readonly LOG_FILE='/var/log/autologin-lock-guard.log'
+
+# Seconds spent clearing the flag at the start of every boot.
+#
+# This does NOT prevent the current boot from locking, and is not intended to.
+# loginwindow reads the flag ~8s into boot, while launchd has been measured
+# starting this daemon 19-92s in, so we always lose that race. What this window
+# buys is cleanup: it removes the flag loginwindow just consumed (and re-removes
+# it if loginwindow rewrites it ~19s in), so the NEXT boot is clean even if the
+# post-update watch below never runs or is interrupted.
+#
+# Wall-clock, not iterations: each defaults read/delete pair costs well over a
+# second, so this loop runs fewer times than the number suggests.
+readonly RACE_WINDOW=45
+
+# Post-update watch. We keep watching for at least GRACE_AFTER_INSTALLER seconds,
+# and the clock restarts for as long as the installer UI (Template Migration /
+# Setup Assistant) is still on screen -- on a major upgrade that is ~10 minutes
+# and the lock lands at the very end of it. HARD_CAP stops us watching forever.
+readonly POLL_INTERVAL=10
+readonly GRACE_AFTER_INSTALLER=300
+readonly HARD_CAP=2700
+
+# An unrotated daemon log can grow until it fills the disk. This one writes a
+# handful of lines per boot, but truncate anyway rather than trust that forever.
+readonly LOG_MAX_BYTES=1048576 # 1 MB
+
+# Timestamps are UTC, deliberately. This daemon can run before the timezone is
+# configured, so a local-time stamp would render some boots as -0700 and others
+# as +0000 in the same file. UTC also lines up directly with the early-boot
+# entries in `log show`, which are themselves rendered UTC for the same reason.
+log() {
+    print -r -- "$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')  $*" >>"${LOG_FILE}" 2>/dev/null
+}
+
+trim_log() {
+    if [[ -f "${LOG_FILE}" ]]; then
+        local size
+        size=$(/usr/bin/stat -f%z "${LOG_FILE}" 2>/dev/null) || return 0
+        if [[ "${size}" -gt "${LOG_MAX_BYTES}" ]]; then
+            /usr/bin/truncate -s 0 "${LOG_FILE}" 2>/dev/null
+        fi
+    fi
+}
+
+# Delete the latch if present. Returns 0 only when something was actually cleared.
+clear_latch() {
+    if /usr/bin/defaults read "${LOGINWINDOW_PLIST}" "${LATCH_KEY}" >/dev/null 2>&1; then
+        if /usr/bin/defaults delete "${LOGINWINDOW_PLIST}" "${LATCH_KEY}" >/dev/null 2>&1; then
+            log "cleared ${LATCH_KEY}"
+            return 0
+        fi
+        log "WARN: ${LATCH_KEY} present but delete failed"
+    fi
+    return 1
+}
+
+# Locked   -> ioreg has CGSSessionScreenIsLocked followed by <true/>
+# Unlocked -> the key is absent from the session dictionary entirely.
+# NOTE: an installer shield window is NOT a lock and will read as unlocked here.
+screen_is_locked() {
+    /usr/sbin/ioreg -n Root -d1 -a 2>/dev/null \
+        | /usr/bin/tr -d '\t' \
+        | /usr/bin/grep -A1 'CGSSessionScreenIsLocked' \
+        | /usr/bin/grep -q '<true/>'
+}
+
+# Post-upgrade UI that runs before the lock lands on a major version bump.
+installer_ui_running() {
+    /usr/bin/pgrep -x 'Setup Assistant' >/dev/null 2>&1 && return 0
+    /usr/bin/pgrep -x 'Installer Progress' >/dev/null 2>&1 && return 0
+    return 1
+}
+
+stamp_build() {
+    print -rn -- "$1" >"${STATE_FILE}"
+}
+
+trim_log
+
+current_build=$(/usr/bin/sw_vers -buildVersion 2>/dev/null)
+if [[ -z "${current_build}" ]]; then
+    log "ERROR: could not read build version; exiting"
+    exit 1
+fi
+
+previous_build=''
+[[ -f "${STATE_FILE}" ]] && previous_build=$(/bin/cat "${STATE_FILE}" 2>/dev/null)
+
+log "=== start: build=${current_build} previous=${previous_build:-<none>} ==="
+
+# Phase 1 -- clear the flag. We cannot beat loginwindow to it (see RACE_WINDOW),
+# so this is cleanup for the next boot rather than prevention for this one.
+# NOTE: this phase does not watch for a lock. A lock landing inside this window
+# is not noticed until Phase 2 begins, which costs up to RACE_WINDOW seconds.
+race_until=$(( $(/bin/date +%s) + RACE_WINDOW ))
+while (( $(/bin/date +%s) < race_until )); do
+    clear_latch
+    /bin/sleep 1
+done
+
+# First run after install: record the build and stop. Installing must never
+# trigger a reboot.
+if [[ -z "${previous_build}" ]]; then
+    stamp_build "${current_build}"
+    log "first run; recorded build ${current_build}; no further action"
+    exit 0
+fi
+
+if [[ "${previous_build}" == "${current_build}" ]]; then
+    # Phase 1 logs its own line if it actually cleared anything, so do not
+    # claim a clear here -- on a clean boot there is nothing to clear.
+    log "no build change; no reboot needed"
+    exit 0
+fi
+
+# Phase 2 -- post-update boot. Watch for the lock rather than guessing when it
+# will arrive.
+#
+# The build stamp is deliberately NOT written yet. v1.0 wrote it up front, so a
+# premature "not locked" verdict permanently consumed the build change and the
+# machine could never self-heal. Leaving it unwritten means an interrupted or
+# inconclusive watch simply retries on the next boot -- and the watch only ever
+# reboots when it has positively observed a lock, so retrying is safe.
+log "build changed ${previous_build} -> ${current_build} (post-update boot); watching for lock"
+
+watch_started=$(/bin/date +%s)
+hard_deadline=$(( watch_started + HARD_CAP ))
+deadline=$(( watch_started + GRACE_AFTER_INSTALLER ))
+installer_seen=0
+
+while :; do
+    now=$(/bin/date +%s)
+
+    if (( now >= hard_deadline )); then
+        log "hard cap of ${HARD_CAP}s reached; giving up watching"
+        break
+    fi
+
+    # Keep the clock alive while the post-upgrade UI is still on screen.
+    if installer_ui_running; then
+        if (( installer_seen == 0 )); then
+            log "installer UI present (Template Migration / Setup Assistant); extending watch"
+            installer_seen=1
+        fi
+        deadline=$(( now + GRACE_AFTER_INSTALLER ))
+    elif (( installer_seen == 1 )); then
+        log "installer UI finished; watching a further ${GRACE_AFTER_INSTALLER}s"
+        installer_seen=2
+    fi
+
+    if (( now >= deadline )); then
+        log "no lock observed within watch window"
+        break
+    fi
+
+    clear_latch
+
+    if screen_is_locked; then
+        log "screen locked $(( now - watch_started ))s into watch; recovering"
+        clear_latch
+        # Stamp BEFORE rebooting so the next boot cannot loop.
+        stamp_build "${current_build}"
+        log "rebooting once to clear post-update screen lock"
+        /sbin/shutdown -r now 'autologin-lock-guard: clearing post-update screen lock' >/dev/null 2>&1
+        exit 0
+    fi
+
+    /bin/sleep "${POLL_INTERVAL}"
+done
+
+# Watch ended without ever seeing a lock. Record the build so we stop treating
+# this as a post-update boot.
+stamp_build "${current_build}"
+log "watch complete; no lock seen; recorded build ${current_build}"
+exit 0

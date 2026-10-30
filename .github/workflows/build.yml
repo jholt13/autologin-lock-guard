@@ -1,0 +1,73 @@
+name: build
+
+# Lints the payload on every push and pull request. Pushing a vX.Y tag also
+# builds the package with munkipkg and attaches it to a GitHub release.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck does not understand zsh, so parse the scripts with zsh itself.
+      - name: Parse scripts
+        run: |
+          set -euo pipefail
+          for f in payload/opt/autologin-lock-guard/bin/autologin-lock-guard scripts/postinstall; do
+            zsh -n "$f"
+            echo "$f ok"
+          done
+
+      - name: Lint plists and build-info
+        run: |
+          set -euo pipefail
+          plutil -lint payload/Library/LaunchDaemons/*.plist
+          jq empty build-info.json
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint]
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      MP_SHA: "85979b52db3f96d4a2355ac6868b2ae0642d2b75"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set package version from tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          jq --arg v "${version}" '.version = $v' build-info.json > "$RUNNER_TEMP/build-info.json"
+          mv "$RUNNER_TEMP/build-info.json" build-info.json
+          cat build-info.json
+
+      - name: Install munkipkg
+        run: |
+          curl -fsSL "https://github.com/munki/munki-pkg/archive/${MP_SHA}.zip" -o munki-pkg.zip
+          unzip -q munki-pkg.zip -d "$RUNNER_TEMP/tools"
+
+      - name: Build package
+        run: |
+          python3 "$RUNNER_TEMP/tools/munki-pkg-${MP_SHA}/munkipkg" .
+          ls -la build
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "build/autologin-lock-guard-${VERSION}.pkg" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

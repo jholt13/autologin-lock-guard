@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.github.jholt13.autologin-lock-guard</string>
+	<key>Program</key>
+	<string>/opt/autologin-lock-guard/bin/autologin-lock-guard</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/autologin-lock-guard.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/autologin-lock-guard.err</string>
+</dict>
+</plist>
